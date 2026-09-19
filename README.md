@@ -1,48 +1,66 @@
 # Js_secret_scanner
 
----
+## Installation
 
-## How to use it
-
-**1. Populate `js_files.txt`** — one JS URL per line:
-```
-https://target.com/static/js/app.js
-https://target.com/assets/bundle.js
-```
-
-**2. Run the scanner:**
 ```bash
-# Basic usage
-python3 js_secret_scanner.py
-
-# Custom options
-python3 js_secret_scanner.py -i js_files.txt -o report.html -t 5
+pip install requests colorama
 ```
 
-**3. View the report** — open `scan_report.html` in any browser.
+## Usage
 
----
+**Basic usage:**
+```bash
+python js_secret_scanner.py js_files.txt
+```
 
-## What it detects (60+ patterns across 7 categories)
+**Custom output directory and more workers:**
+```bash
+python js_secret_scanner.py js_files.txt -o ./js_downloads -w 20
+```
 
-| Category | Examples |
-|---|---|
-| **Cloud API Keys** | AWS, GCP, Azure, Firebase, Heroku |
-| **Payment** | Stripe live/test, Square, PayPal |
-| **Messaging/Auth** | Slack, Twilio, SendGrid, Mailgun |
-| **Dev Tokens** | GitHub, GitLab, NPM, Hugging Face, OpenAI |
-| **Private Keys** | RSA, EC, SSH, PGP |
-| **DB Connections** | MongoDB, MySQL, PostgreSQL, Redis |
-| **Code Patterns** | Hardcoded passwords, JWT, Bearer tokens, Basic Auth URLs |
+**Download only (no analysis):**
+```bash
+python js_secret_scanner.py js_files.txt --urls-only
+```
 
-## Flags
+**Analyze already-downloaded files:**
+```bash
+python js_secret_scanner.py js_files.txt --analyze-only ./js_downloads
+```
 
-| Flag | Description |
-|---|---|
-| `-i` | Input file (default: `js_files.txt`) |
-| `-o` | HTML output report (default: `scan_report.html`) |
-| `-j` | JSON output report (default: `scan_report.json`) |
-| `-t` | Threads (default: `3` — be polite to Wayback) |
-| `-q` | Quiet mode |
+## Features
 
-The tool uses the **Wayback CDX API** to find historical snapshots of each JS file, scans each snapshot, and generates a clickable HTML report with severity badges (Critical / High / Medium / Low). All matched values are **redacted** in the output for safety.
+### Downloader
+- **Concurrent downloads** with configurable worker count (default 10)
+- **Retry logic** for transient failures (429, 5xx errors)
+- **Safe filenames** derived from URLs with SHA1 hash suffix to prevent collisions
+- **Caching** — already-downloaded files are skipped on re-runs
+- **No size limits** for downloads
+
+### Secret Detection (60+ patterns)
+- **Cloud providers:** AWS, GCP, Azure, DigitalOcean, Heroku, Firebase
+- **Code hosting:** GitHub (all token types), GitLab
+- **Payments:** Stripe (live/test), PayPal/Braintree, Square, Shopify
+- **Comms:** Slack (tokens + webhooks), Discord, Telegram, Twilio, SendGrid, Mailgun
+- **Crypto:** RSA, DSA, EC, OpenSSH, PGP private keys
+- **Databases:** MongoDB, PostgreSQL, MySQL, Redis connection strings
+- **Others:** JWTs, OAuth tokens, generic API keys/secrets, basic auth in URLs, high-entropy strings
+
+### Analysis Features
+- **Severity levels:** CRITICAL, HIGH, MEDIUM, LOW
+- **Deduplication** within each file
+- **False positive filtering** for common placeholders (`your_api_key`, `xxxxxxxx`, etc.)
+- **Context snippets** around each finding
+- **Line numbers** for easy location
+
+### Reporting
+- **Color-coded** terminal output (via colorama)
+- **JSON report** for automation/tooling
+- **Text report** for easy reading
+
+## Notes
+
+1. **Only scan what you're authorized to scan.** Downloading and analyzing JS files from sites you don't own may violate terms of service or laws.
+2. The **high-entropy string** detector can produce false positives — it's flagged as LOW severity for a reason.
+3. Files are saved even if the content-type isn't exactly JS, since many CDNs serve JS as `text/plain` or `application/octet-stream`.
+4. You can easily **extend the patterns list** at the top of the script — just add `(name, regex, severity)` tuples.
