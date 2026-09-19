@@ -1,477 +1,563 @@
 #!/usr/bin/env python3
 """
-JS Secret Scanner - Checks JavaScript files (via Wayback Machine) for sensitive data
-Usage: python3 js_secret_scanner.py [--input js_files.txt] [--output report.html] [--threads 5]
+JS Secret Scanner - Download and analyze JavaScript files for secrets
 """
 
+import os
 import re
 import sys
-import time
 import json
+import hashlib
 import argparse
-import threading
-import urllib.request
-import urllib.error
-import urllib.parse
+from pathlib import Path
+from urllib.parse import urlparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
-from collections import defaultdict
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+from colorama import init, Fore, Style
 
-# ─────────────────────────────────────────────
-#  SENSITIVE DATA PATTERNS
-# ─────────────────────────────────────────────
-PATTERNS = {
-    # API Keys & Tokens
-    "AWS Access Key":           r'(?<![A-Z0-9])(AKIA|AIPA|ASIA|AGPA|AROA|AIDA|ANPA|ANVA|ASIA)[A-Z0-9]{16}(?![A-Z0-9])',
-    "AWS Secret Key":           r'(?i)aws.{0,20}secret.{0,20}["\']([A-Za-z0-9/+=]{40})["\']',
-    "Google API Key":           r'AIza[0-9A-Za-z\-_]{35}',
-    "Google OAuth Token":       r'ya29\.[0-9A-Za-z\-_]+',
-    "GitHub Token":             r'(ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36,}',
-    "GitHub Classic Token":     r'[gG][iI][tT][hH][uU][bB].{0,30}["\']([0-9a-zA-Z]{40})["\']',
-    "Slack Token":              r'xox[baprs]-[0-9]{10,12}-[0-9]{10,12}-[0-9]{10,12}-[a-z0-9]{32}',
-    "Slack Webhook":            r'https://hooks\.slack\.com/services/T[A-Z0-9]{8}/B[A-Z0-9]{8}/[A-Za-z0-9]{24}',
-    "Stripe Live Key":          r'sk_live_[0-9a-zA-Z]{24,}',
-    "Stripe Public Key":        r'pk_live_[0-9a-zA-Z]{24,}',
-    "Stripe Test Key":          r'sk_test_[0-9a-zA-Z]{24,}',
-    "Twilio Account SID":       r'AC[a-fA-F0-9]{32}',
-    "Twilio Auth Token":        r'(?i)twilio.{0,20}["\']([a-f0-9]{32})["\']',
-    "SendGrid API Key":         r'SG\.[a-zA-Z0-9\-_]{22}\.[a-zA-Z0-9\-_]{43}',
-    "Firebase URL":             r'https://[a-z0-9\-]+\.firebaseio\.com',
-    "Firebase API Key":         r'(?i)firebase.{0,20}["\']([A-Za-z0-9\-_]{35,})["\']',
-    "Mailgun API Key":          r'key-[0-9a-zA-Z]{32}',
-    "Mailchimp API Key":        r'[0-9a-f]{32}-us[0-9]{1,2}',
-    "Heroku API Key":           r'[hH][eE][rR][oO][kK][uU].{0,30}[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}',
-    "Cloudinary URL":           r'cloudinary://[0-9]{9,}:[A-Za-z0-9_\-]+@[a-zA-Z0-9]+',
-    "Algolia API Key":          r'(?i)algolia.{0,30}["\']([A-Za-z0-9]{32})["\']',
-    "Square Access Token":      r'sq0atp-[0-9A-Za-z\-_]{22}',
-    "Square OAuth Secret":      r'sq0csp-[0-9A-Za-z\-_]{43}',
-    "PayPal Client ID":         r'(?i)paypal.{0,30}client.{0,10}["\']([A-Za-z0-9]{60,})["\']',
-    "Shopify Token":            r'shpat_[a-fA-F0-9]{32}',
-    "Shopify Secret":           r'shpss_[a-fA-F0-9]{32}',
-    "Azure Storage Key":        r'DefaultEndpointsProtocol=https;AccountName=[^;]+;AccountKey=[A-Za-z0-9+/=]{88}',
-    "Okta API Token":           r'(?i)okta.{0,30}["\']([0-9a-zA-Z_\-]{42})["\']',
-    "Mapbox Token":             r'pk\.[a-zA-Z0-9]{60}\.[a-zA-Z0-9]{22}',
-    "NPM Token":                r'npm_[A-Za-z0-9]{36}',
-    "Gitlab Token":             r'glpat-[A-Za-z0-9\-_]{20}',
-    "Vault Token":              r's\.[A-Za-z0-9]{24}',
-    "Telegram Bot Token":       r'[0-9]{8,10}:[A-Za-z0-9_\-]{35}',
-    "OpenAI API Key":           r'sk-[A-Za-z0-9]{48}',
-    "Anthropic API Key":        r'sk-ant-[A-Za-z0-9\-_]{93,}',
-    "Hugging Face Token":       r'hf_[A-Za-z0-9]{39}',
+# Initialize colorama for cross-platform colored output
+init(autoreset=True)
 
-    # Private Keys & Certs
-    "RSA Private Key":          r'-----BEGIN RSA PRIVATE KEY-----',
-    "DSA Private Key":          r'-----BEGIN DSA PRIVATE KEY-----',
-    "EC Private Key":           r'-----BEGIN EC PRIVATE KEY-----',
-    "PGP Private Key":          r'-----BEGIN PGP PRIVATE KEY BLOCK-----',
-    "Generic Private Key":      r'-----BEGIN PRIVATE KEY-----',
-    "SSH Private Key":          r'-----BEGIN OPENSSH PRIVATE KEY-----',
+# ============================================================
+# SECRET DETECTION PATTERNS
+# ============================================================
+# Each pattern: (name, regex, severity)
+SECRET_PATTERNS = [
+    # AWS
+    ("AWS Access Key ID", r"(?:A3T[A-Z0-9]|AKIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA|ASIA)[A-Z0-9]{16}", "HIGH"),
+    ("AWS Secret Key", r"(?i)aws(.{0,20})?['\"][0-9a-zA-Z/+]{40}['\"]", "HIGH"),
+    ("AWS MWS Key", r"amzn\.mws\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", "HIGH"),
+    
+    # Google
+    ("Google API Key", r"AIza[0-9A-Za-z\-_]{35}", "HIGH"),
+    ("Google OAuth ID", r"[0-9]+-[0-9A-Za-z_]{32}\.apps\.googleusercontent\.com", "MEDIUM"),
+    ("Google OAuth Access Token", r"ya29\.[0-9A-Za-z\-_]+", "HIGH"),
+    
+    # GitHub
+    ("GitHub Token", r"gh[pousr]_[A-Za-z0-9_]{36,255}", "HIGH"),
+    ("GitHub Personal Access Token (old)", r"ghp_[A-Za-z0-9]{36}", "HIGH"),
+    ("GitHub OAuth", r"gho_[A-Za-z0-9]{36}", "HIGH"),
+    ("GitHub App Token", r"(ghu|ghs)_[A-Za-z0-9]{36}", "HIGH"),
+    
+    # GitLab
+    ("GitLab Personal Access Token", r"glpat-[A-Za-z0-9\-_]{20}", "HIGH"),
+    
+    # Slack
+    ("Slack Token", r"xox[baprs]-([0-9a-zA-Z]{10,48})", "HIGH"),
+    ("Slack Webhook", r"https://hooks\.slack\.com/services/T[a-zA-Z0-9_]{8,}/B[a-zA-Z0-9_]{8,}/[a-zA-Z0-9_]{24}", "HIGH"),
+    
+    # Stripe
+    ("Stripe Live Key", r"sk_live_[0-9a-zA-Z]{24}", "CRITICAL"),
+    ("Stripe Test Key", r"sk_test_[0-9a-zA-Z]{24}", "MEDIUM"),
+    ("Stripe Restricted Key", r"rk_live_[0-9a-zA-Z]{24}", "HIGH"),
+    
+    # Twilio
+    ("Twilio Account SID", r"AC[a-z0-9]{32}", "MEDIUM"),
+    ("Twilio Auth Token", r"(?i)twilio(.{0,20})?['\"][0-9a-f]{32}['\"]", "HIGH"),
+    
+    # SendGrid
+    ("SendGrid API Key", r"SG\.[a-zA-Z0-9_\-]{22}\.[a-zA-Z0-9_\-]{43}", "HIGH"),
+    
+    # Mailgun
+    ("Mailgun API Key", r"key-[0-9a-zA-Z]{32}", "HIGH"),
+    
+    # Heroku
+    ("Heroku API Key", r"(?i)heroku(.{0,20})?['\"][0-9a-f]{32}['\"]", "HIGH"),
+    
+    # Facebook
+    ("Facebook Access Token", r"EAACEdEose0cBA[0-9A-Za-z]+", "HIGH"),
+    
+    # Twitter
+    ("Twitter Access Token", r"[1-9][0-9]+-[0-9a-zA-Z]{40}", "MEDIUM"),
+    
+    # Private Keys
+    ("RSA Private Key", r"-----BEGIN RSA PRIVATE KEY-----", "CRITICAL"),
+    ("DSA Private Key", r"-----BEGIN DSA PRIVATE KEY-----", "CRITICAL"),
+    ("EC Private Key", r"-----BEGIN EC PRIVATE KEY-----", "CRITICAL"),
+    ("OpenSSH Private Key", r"-----BEGIN OPENSSH PRIVATE KEY-----", "CRITICAL"),
+    ("PGP Private Key", r"-----BEGIN PGP PRIVATE KEY BLOCK-----", "CRITICAL"),
+    ("Generic Private Key", r"-----BEGIN PRIVATE KEY-----", "CRITICAL"),
+    
+    # JWT
+    ("JSON Web Token", r"eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}", "MEDIUM"),
+    
+    # Basic Auth in URL
+    ("Basic Auth in URL", r"https?://[a-zA-Z0-9_\-\.]+:[a-zA-Z0-9_\-\.@]+@[a-zA-Z0-9_\-\.]+", "HIGH"),
+    
+    # Generic API keys
+    ("Generic API Key", r"(?i)(api[_\-]?key|apikey)['\"\s:=]+['\"]?([a-zA-Z0-9_\-]{16,64})['\"]?", "MEDIUM"),
+    ("Generic Secret", r"(?i)(secret|passwd|password|pwd|token)['\"\s:=]+['\"]([a-zA-Z0-9_\-!@#$%^&*]{8,64})['\"]", "MEDIUM"),
+    
+    # Database URLs
+    ("MongoDB Connection String", r"mongodb(?:\+srv)?://[^\s'\"]+", "HIGH"),
+    ("PostgreSQL Connection String", r"postgres(?:ql)?://[^\s'\"]+", "HIGH"),
+    ("MySQL Connection String", r"mysql://[^\s'\"]+", "HIGH"),
+    ("Redis Connection String", r"redis://[^\s'\"]+", "HIGH"),
+    
+    # Firebase
+    ("Firebase URL", r"https://[a-z0-9-]+\.firebaseio\.com", "MEDIUM"),
+    ("Firebase Cloud Messaging", r"AAAA[A-Za-z0-9_-]{7}:[A-Za-z0-9_-]{140}", "HIGH"),
+    
+    # Cloudinary
+    ("Cloudinary URL", r"cloudinary://[0-9]+:[A-Za-z0-9_\-]+@[A-Za-z0-9_\-]+", "HIGH"),
+    
+    # npm
+    ("npm Token", r"npm_[A-Za-z0-9]{36}", "HIGH"),
+    
+    # DigitalOcean
+    ("DigitalOcean Token", r"dop_v1_[a-f0-9]{64}", "HIGH"),
+    ("DigitalOcean OAuth", r"doo_v1_[a-f0-9]{64}", "HIGH"),
+    
+    # Shopify
+    ("Shopify Access Token", r"shpat_[a-fA-F0-9]{32}", "HIGH"),
+    ("Shopify Shared Secret", r"shpss_[a-fA-F0-9]{32}", "HIGH"),
+    
+    # Square
+    ("Square Access Token", r"sq0atp-[0-9A-Za-z\-_]{22}", "HIGH"),
+    ("Square OAuth Secret", r"sq0csp-[0-9A-Za-z\-_]{43}", "HIGH"),
+    
+    # PayPal
+    ("PayPal Braintree Token", r"access_token\$production\$[0-9a-z]{16}\$[0-9a-f]{32}", "HIGH"),
+    
+    # Picatic
+    ("Picatic API Key", r"sk_live_[0-9a-z]{32}", "HIGH"),
+    
+    # Discord
+    ("Discord Bot Token", r"[MN][A-Za-z\d]{23}\.[\w-]{6}\.[\w-]{27}", "HIGH"),
+    ("Discord Webhook", r"https://discord(?:app)?\.com/api/webhooks/[0-9]+/[A-Za-z0-9_-]+", "HIGH"),
+    
+    # Telegram
+    ("Telegram Bot Token", r"[0-9]{8,10}:[A-Za-z0-9_-]{35}", "HIGH"),
+    
+    # Generic high entropy (long strings)
+    ("High Entropy String", r"['\"][A-Za-z0-9+/=_\-]{40,}['\"]", "LOW"),
+]
 
-    # Passwords & Secrets
-    "Password in Code":         r'(?i)(password|passwd|pwd)\s*[=:]\s*["\'][^"\']{6,}["\']',
-    "Secret in Code":           r'(?i)(secret|secretkey|secret_key)\s*[=:]\s*["\'][^"\']{6,}["\']',
-    "Auth Token in Code":       r'(?i)(auth.?token|authtoken)\s*[=:]\s*["\'][^"\']{8,}["\']',
-    "Bearer Token":             r'[Bb]earer\s+[A-Za-z0-9\-_=]+\.[A-Za-z0-9\-_=]+\.[A-Za-z0-9\-_.+/=]+',
-    "Basic Auth in URL":        r'https?://[^:]+:[^@]+@[^/\s]+',
-    "API Key in Code":          r'(?i)(api.?key|apikey|access.?key)\s*[=:]\s*["\'][A-Za-z0-9\-_./+=]{10,}["\']',
-    "JWT Token":                r'eyJ[A-Za-z0-9\-_=]+\.[A-Za-z0-9\-_=]+\.[A-Za-z0-9\-_.+/=]+',
+# Compiled patterns for performance
+COMPILED_PATTERNS = [(name, re.compile(pattern), severity) for name, pattern, severity in SECRET_PATTERNS]
 
-    # Connection Strings
-    "MongoDB URI":              r'mongodb(\+srv)?://[^:]+:[^@]+@[^\s"\']+',
-    "MySQL Connection":         r'mysql://[^:]+:[^@]+@[^\s"\']+',
-    "PostgreSQL Connection":    r'postgres(ql)?://[^:]+:[^@]+@[^\s"\']+',
-    "Redis Connection":         r'redis://[^:]+:[^@]+@[^\s"\']+',
-    "JDBC Connection":          r'jdbc:[a-z]+://[^\s"\']+password=[^&\s"\']+',
-    "FTP Credentials":          r'ftp://[^:]+:[^@]+@[^\s"\']+',
 
-    # Internal Infra
-    "Internal IP":              r'(?<!\d)(10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3})(?!\d)',
-    "Localhost Reference":      r'http://localhost(:\d+)?[/\w\-\.?=&%]*',
-    "Debug/Dev Endpoint":       r'(?i)(staging|dev|internal|test|debug|admin)\.(api|backend|server)\.[a-z]{2,}',
-    "S3 Bucket (private)":      r'https?://[a-z0-9\-]+\.s3\.amazonaws\.com/[^\s"\']+',
+# ============================================================
+# DOWNLOADER
+# ============================================================
+class JSDownloader:
+    def __init__(self, output_dir="downloads", max_workers=10, timeout=30, user_agent=None):
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.max_workers = max_workers
+        self.timeout = timeout
+        self.user_agent = user_agent or (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        )
+        self.session = self._create_session()
 
-    # Misc Sensitive
-    "Credit Card Number":       r'\b(?:4[0-9]{12}(?:[0-9]{3})?|5[1-5][0-9]{14}|3[47][0-9]{13}|6(?:011|5[0-9]{2})[0-9]{12})\b',
-    "Social Security Number":   r'\b\d{3}-\d{2}-\d{4}\b',
-    "Hardcoded Email+Pass":     r'(?i)email\s*[=:]\s*["\'][^"\']+@[^"\']+["\'].{0,80}(password|passwd)\s*[=:]\s*["\'][^"\']+["\']',
-}
+    def _create_session(self):
+        session = requests.Session()
+        retries = Retry(
+            total=3,
+            backoff_factor=0.5,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["GET", "HEAD"],
+        )
+        adapter = HTTPAdapter(max_retries=retries, pool_connections=50, pool_maxsize=50)
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        session.headers.update({"User-Agent": self.user_agent})
+        return session
 
-SEVERITY = {
-    "CRITICAL": ["RSA Private Key","DSA Private Key","EC Private Key","PGP Private Key",
-                 "Generic Private Key","SSH Private Key","AWS Secret Key","Password in Code",
-                 "Secret in Code","MongoDB URI","MySQL Connection","PostgreSQL Connection",
-                 "Redis Connection","JDBC Connection","Stripe Live Key","Basic Auth in URL",
-                 "Hardcoded Email+Pass","Credit Card Number","Social Security Number","Bearer Token"],
-    "HIGH":     ["AWS Access Key","GitHub Token","GitHub Classic Token","Slack Token",
-                 "Slack Webhook","Stripe Test Key","SendGrid API Key","Firebase API Key",
-                 "Mailgun API Key","Azure Storage Key","OpenAI API Key","Anthropic API Key",
-                 "Heroku API Key","Shopify Token","Shopify Secret","NPM Token","Gitlab Token",
-                 "Telegram Bot Token","Hugging Face Token","Okta API Token","JWT Token",
-                 "FTP Credentials","Auth Token in Code","API Key in Code"],
-    "MEDIUM":   ["Google API Key","Google OAuth Token","Firebase URL","Mailchimp API Key",
-                 "Stripe Public Key","Twilio Account SID","Twilio Auth Token","Algolia API Key",
-                 "Square Access Token","Square OAuth Secret","PayPal Client ID","Cloudinary URL",
-                 "Mapbox Token","Vault Token","Okta API Token","S3 Bucket (private)",
-                 "Debug/Dev Endpoint"],
-    "LOW":      ["Internal IP","Localhost Reference","Shopify Secret","JDBC Connection"],
-}
+    @staticmethod
+    def _url_to_filename(url):
+        """Create a safe, unique filename from a URL."""
+        parsed = urlparse(url)
+        # Build a readable prefix
+        base = (parsed.netloc + parsed.path).strip("/")
+        # Remove weird chars
+        base = re.sub(r"[^a-zA-Z0-9._\-]", "_", base)
+        # Avoid overly long filenames
+        if len(base) > 100:
+            base = base[:100]
+        # Add a short hash to avoid collisions
+        digest = hashlib.sha1(url.encode("utf-8")).hexdigest()[:8]
+        if not base.endswith(".js"):
+            base += ".js"
+        return f"{base}_{digest}"
 
-def get_severity(pattern_name):
-    for sev, names in SEVERITY.items():
-        if pattern_name in names:
-            return sev
-    return "MEDIUM"
+    def download(self, url):
+        """Download a single JS file. Returns (url, path, success, error)."""
+        url = url.strip()
+        if not url or url.startswith("#"):
+            return url, None, False, "empty/comment"
 
-# ─────────────────────────────────────────────
-#  WAYBACK MACHINE FETCHER
-# ─────────────────────────────────────────────
-WAYBACK_CDX  = "http://web.archive.org/cdx/search/cdx"
-WAYBACK_BASE = "http://web.archive.org/web"
+        if not url.startswith(("http://", "https://")):
+            return url, None, False, "invalid scheme"
 
-def get_wayback_snapshots(url, limit=3):
-    """Get available Wayback Machine snapshots for a URL."""
-    params = urllib.parse.urlencode({
-        "url":    url,
-        "output": "json",
-        "limit":  limit,
-        "fl":     "timestamp,statuscode,digest",
-        "filter": "statuscode:200",
-        "collapse":"digest",
-    })
-    api_url = f"{WAYBACK_CDX}?{params}"
-    try:
-        req = urllib.request.Request(api_url, headers={"User-Agent": "JS-SecretScanner/1.0"})
-        with urllib.request.urlopen(req, timeout=15) as r:
-            data = json.loads(r.read().decode())
-        if len(data) <= 1:
-            return []
-        return [row[0] for row in data[1:]]   # list of timestamps
-    except Exception as e:
-        return []
+        filename = self._url_to_filename(url)
+        filepath = self.output_dir / filename
 
-def fetch_wayback_content(url, timestamp):
-    """Fetch JS file content from Wayback Machine."""
-    wb_url = f"{WAYBACK_BASE}/{timestamp}if_/{url}"
-    try:
-        req = urllib.request.Request(wb_url, headers={"User-Agent": "JS-SecretScanner/1.0"})
-        with urllib.request.urlopen(req, timeout=20) as r:
-            return r.read().decode("utf-8", errors="replace"), wb_url
-    except Exception as e:
-        return None, wb_url
+        # Skip if already downloaded
+        if filepath.exists() and filepath.stat().st_size > 0:
+            return url, str(filepath), True, "cached"
 
-def fetch_direct(url):
-    """Try fetching URL directly as fallback."""
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": "JS-SecretScanner/1.0"})
-        with urllib.request.urlopen(req, timeout=15) as r:
-            return r.read().decode("utf-8", errors="replace")
-    except Exception:
-        return None
+        try:
+            resp = self.session.get(url, timeout=self.timeout, stream=True, allow_redirects=True)
+            resp.raise_for_status()
 
-# ─────────────────────────────────────────────
-#  SCANNER
-# ─────────────────────────────────────────────
-def scan_content(content, source_url):
-    """Scan JS content for all sensitive patterns. Returns list of findings."""
-    findings = []
-    lines = content.splitlines()
-    compiled = {name: re.compile(pat) for name, pat in PATTERNS.items()}
+            # Only save if it looks like text/javascript
+            ctype = resp.headers.get("Content-Type", "").lower()
+            if ctype and not any(x in ctype for x in ("javascript", "ecmascript", "text/plain", "text/html", "application/json", "octet-stream")):
+                # Still save but note the content type
+                pass
 
-    for line_no, line in enumerate(lines, 1):
-        stripped = line.strip()
-        if not stripped or stripped.startswith("//"):
-            continue
-        for name, regex in compiled.items():
-            for match in regex.finditer(line):
-                matched_val = match.group(0)
-                # Redact middle of value for safety
-                if len(matched_val) > 20:
-                    display = matched_val[:8] + "..." + matched_val[-4:]
+            with open(filepath, "wb") as f:
+                for chunk in resp.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+
+            # Sanity check: ensure file isn't empty
+            if filepath.stat().st_size == 0:
+                filepath.unlink(missing_ok=True)
+                return url, None, False, "empty response"
+
+            return url, str(filepath), True, "downloaded"
+
+        except requests.exceptions.Timeout:
+            return url, None, False, "timeout"
+        except requests.exceptions.SSLError:
+            return url, None, False, "ssl error"
+        except requests.exceptions.ConnectionError:
+            return url, None, False, "connection error"
+        except requests.exceptions.HTTPError as e:
+            return url, None, False, f"http {e.response.status_code}"
+        except Exception as e:
+            return url, None, False, f"error: {e.__class__.__name__}"
+
+    def download_all(self, urls):
+        """Download all URLs concurrently."""
+        results = []
+        total = len(urls)
+
+        print(f"{Fore.CYAN}[*] Downloading {total} URLs with {self.max_workers} workers...")
+        print(f"{Fore.CYAN}[*] Output directory: {self.output_dir.resolve()}\n")
+
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            futures = {executor.submit(self.download, url): url for url in urls}
+            completed = 0
+            for future in as_completed(futures):
+                completed += 1
+                url, path, success, msg = future.result()
+                results.append((url, path, success, msg))
+
+                if success:
+                    icon = f"{Fore.GREEN}✓"
+                    detail = msg
                 else:
-                    display = matched_val[:6] + "***"
-                findings.append({
-                    "pattern":  name,
-                    "severity": get_severity(name),
-                    "line_no":  line_no,
-                    "matched":  display,
-                    "context":  stripped[:120],
-                    "source":   source_url,
-                })
-    return findings
+                    icon = f"{Fore.RED}✗"
+                    detail = msg
 
-def process_js_url(url, results_store, lock, verbose=True):
-    """Full pipeline: Wayback snapshots → fetch → scan."""
-    url = url.strip()
-    if not url or url.startswith("#"):
+                # Truncate long URLs for display
+                display_url = url if len(url) < 80 else url[:77] + "..."
+                print(f"  {icon} [{completed}/{total}] {display_url} {Fore.YELLOW}({detail})")
+
+        return results
+
+
+# ============================================================
+# ANALYZER
+# ============================================================
+class SecretAnalyzer:
+    def __init__(self, max_file_size_mb=20):
+        self.max_file_size = max_file_size_mb * 1024 * 1024
+
+    @staticmethod
+    def _get_line_number(text, match_start):
+        return text[:match_start].count("\n") + 1
+
+    @staticmethod
+    def _get_context(text, match_start, match_end, context=60):
+        start = max(0, match_start - context)
+        end = min(len(text), match_end + context)
+        snippet = text[start:end].replace("\n", " ").strip()
+        return snippet
+
+    def analyze_file(self, filepath, url=None):
+        """Analyze a single file for secrets. Returns list of findings."""
+        findings = []
+        path = Path(filepath)
+
+        try:
+            size = path.stat().st_size
+            if size > self.max_file_size:
+                return findings
+
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+        except Exception as e:
+            return findings
+
+        # Deduplicate: track (pattern_name, matched_value) pairs
+        seen = set()
+
+        for name, pattern, severity in COMPILED_PATTERNS:
+            for match in pattern.finditer(content):
+                matched = match.group(0)
+                # Skip super common false positives
+                if self._is_false_positive(name, matched):
+                    continue
+
+                key = (name, matched)
+                if key in seen:
+                    continue
+                seen.add(key)
+
+                line_no = self._get_line_number(content, match.start())
+                context = self._get_context(content, match.start(), match.end())
+
+                findings.append({
+                    "file": str(path),
+                    "url": url,
+                    "type": name,
+                    "severity": severity,
+                    "match": matched[:200],
+                    "line": line_no,
+                    "context": context,
+                })
+
+        return findings
+
+    @staticmethod
+    def _is_false_positive(name, matched):
+        """Filter out obvious false positives."""
+        # Skip JWT-like example tokens
+        if name == "JSON Web Token" and "example" in matched.lower():
+            return True
+
+        # Skip common placeholder values
+        placeholders = {
+            "your_api_key", "your-api-key", "api_key_here",
+            "xxxxxxxx", "aaaaaaaa", "00000000", "1234567890",
+            "changeme", "placeholder", "example", "test_key",
+            "your_secret", "insert_", "replace_",
+        }
+        lower = matched.lower()
+        for p in placeholders:
+            if p in lower:
+                return True
+
+        # Skip generic secrets that are clearly not secrets
+        if name == "Generic Secret":
+            if len(set(matched)) < 4:  # too few unique chars
+                return True
+
+        return False
+
+    def analyze_all(self, files):
+        """Analyze all files. `files` is list of (url, path) tuples."""
+        all_findings = []
+        total = len(files)
+
+        print(f"\n{Fore.CYAN}[*] Analyzing {total} files for secrets...\n")
+
+        for i, (url, path) in enumerate(files, 1):
+            findings = self.analyze_file(path, url)
+            if findings:
+                all_findings.extend(findings)
+
+        return all_findings
+
+
+# ============================================================
+# REPORTER
+# ============================================================
+SEVERITY_COLORS = {
+    "CRITICAL": Fore.MAGENTA + Style.BRIGHT,
+    "HIGH": Fore.RED + Style.BRIGHT,
+    "MEDIUM": Fore.YELLOW,
+    "LOW": Fore.BLUE,
+}
+SEVERITY_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
+
+
+def print_report(findings):
+    """Print findings to terminal."""
+    if not findings:
+        print(f"{Fore.GREEN}[+] No secrets found.")
         return
 
-    entry = {
-        "url":       url,
-        "snapshots": [],
-        "findings":  [],
-        "errors":    [],
-        "status":    "pending",
-    }
+    # Sort by severity then file
+    findings.sort(key=lambda f: (SEVERITY_ORDER.get(f["severity"], 99), f["file"], f["line"]))
 
-    if verbose:
-        print(f"  [→] {url}")
+    print(f"\n{Fore.RED}{Style.BRIGHT}{'=' * 70}")
+    print(f"{Fore.RED}{Style.BRIGHT}  🔍 SECRETS FOUND: {len(findings)}")
+    print(f"{Fore.RED}{Style.BRIGHT}{'=' * 70}\n")
 
-    # 1. Get snapshots
-    timestamps = get_wayback_snapshots(url, limit=3)
-    time.sleep(0.5)   # polite delay
+    current_file = None
+    for f in findings:
+        if f["file"] != current_file:
+            current_file = f["file"]
+            print(f"\n{Fore.CYAN}{Style.BRIGHT}📄 {current_file}")
+            if f["url"]:
+                print(f"   {Fore.CYAN}↳ {f['url']}")
 
-    if not timestamps:
-        entry["errors"].append("No Wayback snapshots found — trying direct fetch")
-        content = fetch_direct(url)
-        if content:
-            entry["snapshots"].append({"timestamp": "live", "wb_url": url})
-            findings = scan_content(content, url)
-            entry["findings"].extend(findings)
-            entry["status"] = "scanned_direct"
-        else:
-            entry["status"] = "no_snapshot"
-            entry["errors"].append("Direct fetch also failed")
-    else:
-        # 2. Scan each snapshot (deduplicate by digest is already done by CDX)
-        for ts in timestamps:
-            content, wb_url = fetch_wayback_content(url, ts)
-            time.sleep(0.3)
-            snap = {"timestamp": ts, "wb_url": wb_url}
-            if content:
-                findings = scan_content(content, wb_url)
-                snap["finding_count"] = len(findings)
-                entry["findings"].extend(findings)
-                entry["status"] = "scanned"
-            else:
-                snap["finding_count"] = 0
-                entry["errors"].append(f"Failed to fetch snapshot {ts}")
-            entry["snapshots"].append(snap)
+        color = SEVERITY_COLORS.get(f["severity"], "")
+        print(f"   {color}[{f['severity']}]{Style.RESET_ALL} {Fore.WHITE}{f['type']}{Style.RESET_ALL}")
+        print(f"     Line {f['line']}: {Fore.YELLOW}{f['match']}{Style.RESET_ALL}")
+        if f["context"]:
+            print(f"     Context: {Fore.LIGHTBLACK_EX}{f['context']}{Style.RESET_ALL}")
 
-    # Deduplicate findings by (pattern, line_no, matched)
-    seen = set()
-    deduped = []
-    for f in entry["findings"]:
-        key = (f["pattern"], f["line_no"], f["matched"])
-        if key not in seen:
-            seen.add(key)
-            deduped.append(f)
-    entry["findings"] = deduped
 
-    if verbose:
-        cnt = len(entry["findings"])
-        tag = f"⚠ {cnt} findings" if cnt else "✓ clean"
-        print(f"      {tag}  [{entry['status']}]")
+def save_reports(findings, json_path="secrets_report.json", txt_path="secrets_report.txt"):
+    """Save findings to JSON and text reports."""
+    # JSON report
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump({
+            "generated_at": datetime.utcnow().isoformat(),
+            "total_findings": len(findings),
+            "findings": findings,
+        }, f, indent=2)
 
-    with lock:
-        results_store.append(entry)
+    # Text report
+    with open(txt_path, "w", encoding="utf-8") as f:
+        f.write(f"JS Secret Scanner Report\n")
+        f.write(f"Generated: {datetime.utcnow().isoformat()}\n")
+        f.write(f"Total findings: {len(findings)}\n")
+        f.write("=" * 70 + "\n\n")
 
-# ─────────────────────────────────────────────
-#  HTML REPORT
-# ─────────────────────────────────────────────
-SEV_COLOR = {"CRITICAL": "#e74c3c", "HIGH": "#e67e22", "MEDIUM": "#f1c40f", "LOW": "#3498db"}
+        findings_sorted = sorted(findings, key=lambda x: (SEVERITY_ORDER.get(x["severity"], 99), x["file"]))
+        for f_item in findings_sorted:
+            f.write(f"[{f_item['severity']}] {f_item['type']}\n")
+            f.write(f"  File: {f_item['file']}\n")
+            if f_item["url"]:
+                f.write(f"  URL: {f_item['url']}\n")
+            f.write(f"  Line: {f_item['line']}\n")
+            f.write(f"  Match: {f_item['match']}\n")
+            f.write(f"  Context: {f_item['context']}\n")
+            f.write("-" * 70 + "\n")
 
-def build_html_report(results, output_path):
-    total_urls    = len(results)
-    total_findings= sum(len(r["findings"]) for r in results)
-    clean_urls    = sum(1 for r in results if not r["findings"])
-    vuln_urls     = total_urls - clean_urls
-    sev_counts    = defaultdict(int)
-    for r in results:
-        for f in r["findings"]:
-            sev_counts[f["severity"]] += 1
+    print(f"\n{Fore.GREEN}[+] JSON report saved to: {json_path}")
+    print(f"{Fore.GREEN}[+] Text report saved to: {txt_path}")
 
-    rows = ""
-    for r in sorted(results, key=lambda x: -len(x["findings"])):
-        url        = r["url"]
-        snaps      = len(r["snapshots"])
-        snap_ts    = ", ".join(s["timestamp"] for s in r["snapshots"][:2]) or "—"
-        status     = r["status"]
-        findings   = r["findings"]
-        f_count    = len(findings)
-        badge_color= "#e74c3c" if f_count else "#27ae60"
-        badge_txt  = f"{f_count} finding(s)" if f_count else "Clean"
 
-        finding_rows = ""
-        for f in findings:
-            sc = SEV_COLOR.get(f["severity"], "#888")
-            finding_rows += f"""
-            <tr>
-              <td><span style="background:{sc};color:#fff;padding:2px 7px;border-radius:4px;font-size:12px">{f['severity']}</span></td>
-              <td>{f['pattern']}</td>
-              <td style="font-family:monospace;font-size:12px">{f['matched']}</td>
-              <td style="text-align:center">{f['line_no']}</td>
-              <td style="font-family:monospace;font-size:11px;max-width:400px;word-break:break-all">{f['context'][:100]}</td>
-            </tr>"""
+# ============================================================
+# MAIN
+# ============================================================
+def read_urls(filepath):
+    """Read URLs from file, one per line."""
+    with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
+        urls = [line.strip() for line in f if line.strip() and not line.strip().startswith("#")]
+    return urls
 
-        snap_links = " | ".join(
-            f'<a href="{s["wb_url"]}" target="_blank">{s["timestamp"]}</a>'
-            for s in r["snapshots"]
-        ) or "—"
 
-        rows += f"""
-        <tr class="url-row" onclick="toggle('{url}')">
-          <td style="font-family:monospace;font-size:13px;word-break:break-all">{url}</td>
-          <td style="text-align:center">{snaps}</td>
-          <td>{snap_links}</td>
-          <td style="text-align:center">{status}</td>
-          <td><span style="background:{badge_color};color:#fff;padding:2px 8px;border-radius:12px;font-size:12px">{badge_txt}</span></td>
-        </tr>
-        <tr id="details-{url}" style="display:none">
-          <td colspan="5" style="background:#f8f9fa;padding:0">
-            {'<table style="width:100%;border-collapse:collapse"><thead><tr style="background:#dee2e6"><th>Severity</th><th>Pattern</th><th>Match (redacted)</th><th>Line</th><th>Context</th></tr></thead><tbody>' + finding_rows + '</tbody></table>' if findings else '<div style="padding:10px;color:green">✓ No sensitive data found in this file.</div>'}
-            {'<div style="padding:6px 10px;font-size:12px;color:#666">Errors: ' + '; '.join(r['errors']) + '</div>' if r['errors'] else ''}
-          </td>
-        </tr>"""
-
-    html = f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>JS Secret Scanner Report</title>
-<style>
-  *{{box-sizing:border-box;margin:0;padding:0}}
-  body{{font-family:'Segoe UI',sans-serif;background:#f0f2f5;color:#333}}
-  header{{background:linear-gradient(135deg,#1a1a2e,#16213e);color:#fff;padding:28px 40px}}
-  header h1{{font-size:26px;font-weight:700;margin-bottom:4px}}
-  header p{{color:#adb5bd;font-size:14px}}
-  .container{{max-width:1300px;margin:24px auto;padding:0 20px}}
-  .stats{{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:16px;margin-bottom:24px}}
-  .stat{{background:#fff;border-radius:10px;padding:18px;text-align:center;box-shadow:0 1px 4px rgba(0,0,0,.08)}}
-  .stat .val{{font-size:32px;font-weight:700;margin-bottom:4px}}
-  .stat .lbl{{font-size:12px;color:#666;text-transform:uppercase;letter-spacing:.5px}}
-  .card{{background:#fff;border-radius:10px;box-shadow:0 1px 4px rgba(0,0,0,.08);overflow:hidden;margin-bottom:24px}}
-  .card-header{{padding:16px 20px;background:#343a40;color:#fff;font-weight:600;display:flex;justify-content:space-between;align-items:center}}
-  table{{width:100%;border-collapse:collapse}}
-  thead tr{{background:#e9ecef}}
-  thead th{{padding:10px 12px;text-align:left;font-size:13px;color:#495057;font-weight:600;white-space:nowrap}}
-  tbody tr{{border-bottom:1px solid #f0f0f0}}
-  tbody tr:hover{{background:#f8f9fa}}
-  tbody td{{padding:10px 12px;font-size:13px;vertical-align:middle}}
-  .url-row{{cursor:pointer}}
-  .url-row:hover td:first-child{{color:#0066cc;text-decoration:underline}}
-  .badge-sev{{display:flex;gap:10px;flex-wrap:wrap;margin-top:4px}}
-  .badge-sev span{{padding:3px 10px;border-radius:12px;font-size:12px;font-weight:600;color:#fff}}
-  footer{{text-align:center;color:#999;font-size:12px;padding:20px}}
-</style>
-</head>
-<body>
-<header>
-  <h1>🔍 JS Secret Scanner — Wayback Machine Edition</h1>
-  <p>Generated: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")} &nbsp;|&nbsp; {total_urls} URLs scanned</p>
-</header>
-<div class="container">
-  <div class="stats">
-    <div class="stat"><div class="val" style="color:#e74c3c">{total_findings}</div><div class="lbl">Total Findings</div></div>
-    <div class="stat"><div class="val" style="color:#e67e22">{vuln_urls}</div><div class="lbl">Vulnerable Files</div></div>
-    <div class="stat"><div class="val" style="color:#27ae60">{clean_urls}</div><div class="lbl">Clean Files</div></div>
-    <div class="stat"><div class="val" style="color:#e74c3c">{sev_counts['CRITICAL']}</div><div class="lbl">Critical</div></div>
-    <div class="stat"><div class="val" style="color:#e67e22">{sev_counts['HIGH']}</div><div class="lbl">High</div></div>
-    <div class="stat"><div class="val" style="color:#f1c40f">{sev_counts['MEDIUM']}</div><div class="lbl">Medium</div></div>
-    <div class="stat"><div class="val" style="color:#3498db">{sev_counts['LOW']}</div><div class="lbl">Low</div></div>
-  </div>
-  <div class="card">
-    <div class="card-header">
-      <span>Scan Results — Click a row to expand findings</span>
-      <span style="font-size:13px;font-weight:400">{total_urls} files</span>
-    </div>
-    <table>
-      <thead><tr>
-        <th>JS File URL</th><th>Snapshots</th><th>Wayback Links</th><th>Status</th><th>Result</th>
-      </tr></thead>
-      <tbody>{rows}</tbody>
-    </table>
-  </div>
-</div>
-<footer>JS Secret Scanner &nbsp;•&nbsp; Wayback Machine &nbsp;•&nbsp; For authorized security research only</footer>
-<script>
-function toggle(url){{
-  var el=document.getElementById('details-'+url);
-  el.style.display=(el.style.display==='none'?'':'none');
-}}
-</script>
-</body>
-</html>"""
-
-    with open(output_path, "w", encoding="utf-8") as f:
-        f.write(html)
-
-def build_json_report(results, output_path):
-    with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(results, f, indent=2)
-
-# ─────────────────────────────────────────────
-#  MAIN
-# ─────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(
-        description="JS Secret Scanner — checks JS files via Wayback Machine for sensitive data"
+        description="Download JS files from URLs and analyze them for secrets.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python js_secret_scanner.py js_files.txt
+  python js_secret_scanner.py js_files.txt -o ./js_downloads -w 20
+  python js_secret_scanner.py js_files.txt --urls-only
+  python js_secret_scanner.py js_files.txt --analyze-only ./js_downloads
+        """,
     )
-    parser.add_argument("-i", "--input",   default="js_files.txt", help="Input file with JS URLs (one per line)")
-    parser.add_argument("-o", "--output",  default="scan_report.html", help="Output HTML report filename")
-    parser.add_argument("-j", "--json",    default="scan_report.json", help="Output JSON report filename")
-    parser.add_argument("-t", "--threads", type=int, default=3, help="Concurrent threads (default: 3)")
-    parser.add_argument("-q", "--quiet",   action="store_true", help="Suppress per-URL output")
+    parser.add_argument("input", help="File containing URLs (one per line)")
+    parser.add_argument("-o", "--output", default="js_downloads", help="Output directory (default: js_downloads)")
+    parser.add_argument("-w", "--workers", type=int, default=10, help="Concurrent downloads (default: 10)")
+    parser.add_argument("-t", "--timeout", type=int, default=30, help="Request timeout in seconds (default: 30)")
+    parser.add_argument("--urls-only", action="store_true", help="Only download, skip analysis")
+    parser.add_argument("--analyze-only", metavar="DIR", help="Skip download, analyze files in DIR")
+    parser.add_argument("--json-out", default="secrets_report.json", help="JSON report output path")
+    parser.add_argument("--txt-out", default="secrets_report.txt", help="Text report output path")
+    parser.add_argument("--max-size", type=int, default=20, help="Max file size in MB for analysis (default: 20)")
+
     args = parser.parse_args()
 
-    # Read URLs
-    try:
-        with open(args.input, "r", encoding="utf-8") as f:
-            urls = [line.strip() for line in f if line.strip() and not line.startswith("#")]
-    except FileNotFoundError:
-        print(f"[ERROR] Input file '{args.input}' not found.")
-        print("Create a file with one JS URL per line, e.g.:")
-        print("  https://example.com/assets/app.js")
+    print(f"{Fore.CYAN}{Style.BRIGHT}")
+    print("╔══════════════════════════════════════════════════════════╗")
+    print("║          JS Secret Scanner - Download & Analyze          ║")
+    print("╚══════════════════════════════════════════════════════════╝")
+    print(Style.RESET_ALL)
+
+    downloaded = []  # list of (url, path)
+
+    # ---- Phase 1: Download ----
+    if not args.analyze_only:
+        if not os.path.isfile(args.input):
+            print(f"{Fore.RED}[!] Input file not found: {args.input}")
+            sys.exit(1)
+
+        urls = read_urls(args.input)
+        if not urls:
+            print(f"{Fore.RED}[!] No URLs found in {args.input}")
+            sys.exit(1)
+
+        print(f"{Fore.GREEN}[+] Loaded {len(urls)} URLs from {args.input}")
+
+        downloader = JSDownloader(
+            output_dir=args.output,
+            max_workers=args.workers,
+            timeout=args.timeout,
+        )
+        results = downloader.download_all(urls)
+
+        success = sum(1 for _, _, ok, _ in results if ok)
+        print(f"\n{Fore.GREEN}[+] Downloads complete: {success}/{len(urls)} successful")
+
+        for url, path, ok, _ in results:
+            if ok and path:
+                downloaded.append((url, path))
+    else:
+        # Analyze-only mode: enumerate files in directory
+        d = Path(args.analyze_only)
+        if not d.is_dir():
+            print(f"{Fore.RED}[!] Directory not found: {args.analyze_only}")
+            sys.exit(1)
+        for f in sorted(d.rglob("*")):
+            if f.is_file():
+                downloaded.append((None, str(f)))
+        print(f"{Fore.GREEN}[+] Found {len(downloaded)} files in {args.analyze_only}")
+
+    # ---- Phase 2: Analyze ----
+    if args.urls_only:
+        print(f"\n{Fore.YELLOW}[*] --urls-only specified, skipping analysis.")
+        return
+
+    if not downloaded:
+        print(f"{Fore.RED}[!] No files to analyze.")
         sys.exit(1)
 
-    print(f"\n{'='*60}")
-    print(f"  JS Secret Scanner — Wayback Machine Edition")
-    print(f"{'='*60}")
-    print(f"  Input:    {args.input} ({len(urls)} URLs)")
-    print(f"  Threads:  {args.threads}")
-    print(f"  Patterns: {len(PATTERNS)}")
-    print(f"{'='*60}\n")
+    analyzer = SecretAnalyzer(max_file_size_mb=args.max_size)
+    findings = analyzer.analyze_all(downloaded)
 
-    results = []
-    lock    = threading.Lock()
-    sem     = threading.Semaphore(args.threads)
+    # ---- Phase 3: Report ----
+    print_report(findings)
 
-    def worker(url):
-        with sem:
-            process_js_url(url, results, lock, verbose=not args.quiet)
-
-    threads = []
-    for url in urls:
-        t = threading.Thread(target=worker, args=(url,))
-        t.start()
-        threads.append(t)
-        time.sleep(0.2)   # stagger starts
-
-    for t in threads:
-        t.join()
-
-    # Reports
-    build_html_report(results, args.output)
-    build_json_report(results, args.json)
+    if findings:
+        save_reports(findings, args.json_out, args.txt_out)
 
     # Summary
-    total_findings = sum(len(r["findings"]) for r in results)
-    sev = defaultdict(int)
-    for r in results:
-        for f in r["findings"]:
-            sev[f["severity"]] += 1
+    print(f"\n{Fore.CYAN}{'=' * 70}")
+    print(f"{Fore.CYAN}SUMMARY")
+    print(f"{Fore.CYAN}{'=' * 70}")
+    print(f"  Files downloaded: {len(downloaded)}")
+    print(f"  Total findings:   {len(findings)}")
 
-    print(f"\n{'='*60}")
-    print(f"  SCAN COMPLETE")
-    print(f"{'='*60}")
-    print(f"  URLs scanned : {len(results)}")
-    print(f"  Total findings: {total_findings}")
-    print(f"  CRITICAL : {sev['CRITICAL']}")
-    print(f"  HIGH     : {sev['HIGH']}")
-    print(f"  MEDIUM   : {sev['MEDIUM']}")
-    print(f"  LOW      : {sev['LOW']}")
-    print(f"\n  HTML Report : {args.output}")
-    print(f"  JSON Report : {args.json}")
-    print(f"{'='*60}\n")
+    by_sev = {}
+    for f in findings:
+        by_sev[f["severity"]] = by_sev.get(f["severity"], 0) + 1
+
+    for sev in ["CRITICAL", "HIGH", "MEDIUM", "LOW"]:
+        if sev in by_sev:
+            color = SEVERITY_COLORS[sev]
+            print(f"  {color}{sev}: {by_sev[sev]}{Style.RESET_ALL}")
+
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print(f"\n{Fore.YELLOW}[!] Interrupted by user.")
+        sys.exit(130)
